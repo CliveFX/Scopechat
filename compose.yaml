@@ -1,0 +1,55 @@
+services:
+  web:
+    build: ./scope_site
+#    network_mode: "host"
+    ports:
+        - "5000:5000"            # host:container
+    environment:
+      SAT_API_BASE: http://sat_api_base:8000
+      SLEW_BASE: http://slew_base:8001
+      CATALOG: http://catalog_base:8002
+    depends_on:
+      sat_api_base:
+        condition: service_healthy
+      slew_base:
+        condition: service_healthy
+#    healthcheck:
+ #     test: ["CMD-SHELL", "curl -fsS http://localhost:5000/healthz || exit 1"]
+  #    interval: 10s
+   #   timeout: 2s
+    #  retries: 5
+    restart: unless-stopped
+
+  sat_api_base:
+    build: ./TLE_server
+    ports:
+      - "9800:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+  slew_base:
+    build: ./10MicronServer
+    ports:
+      - "8001:8001"                 # internal-only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8001/healthz || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+  catalog_base:
+    build: ./catalog_server
+    environment:
+      - TELESCOPE_API_HOSTNAME=slew_base
+    ports:
+      - "8002:8002"                 # internal-only
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8002/healthz || exit 1"]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+    restart: unless-stopped
+

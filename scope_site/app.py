@@ -1,0 +1,502 @@
+# app.py
+import os
+from urllib.parse import quote
+from flask import Flask, request, jsonify, render_template_string
+import requests
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Config (override via env vars)
+API_BASE = os.environ.get("SAT_API_BASE", "http://localhost:8000")   # e.g., http://api.example.com
+SLEW_BASE = os.environ.get("SLEW_BASE", "http://localhost:8001")     # e.g., http://mount.local:8001
+
+# Castro Valley defaults
+DEFAULTS = {
+    "lat": 37.6940,
+    "lon": -122.0860,
+    "alt_m": 50,          # meters
+    "limit": 100,
+    # thresholds
+    "min_el": 30,         # for "above" and used as base for upcoming
+    "min_peak_el": 45,    # for upcoming
+    # search window (upcoming)
+    "window_min": 120,
+    "step_s": 15,
+    # orbital altitude filter (applies to both)
+    "min_orbital_alt_km": 0.0,
+    "max_orbital_alt_km": 2000.0,
+}
+
+# ---------------------------------------------------------------------------
+# Pages
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True), 200
+@app.route("/")
+def index():
+    return render_template_string(INDEX_HTML, defaults=DEFAULTS)
+
+# ---------------------------------------------------------------------------
+# Satellite API proxy (ensures correct param names and avoids browser CORS)
+@app.get("/api/passes")
+def api_passes():
+    """
+    Query params:
+      mode=above|upcoming  (default: above)
+      lat, lon, alt_m, min_el, limit, min_orbital_alt_km, max_orbital_alt_km
+      (upcoming only): min_peak_el, window_min, step_s
+    """
+    mode = (request.args.get("mode") or "above").lower()
+    if mode not in ("above", "upcoming"):
+        return jsonify({"error": "mode must be 'above' or 'upcoming'"}), 400
+
+    endpoint = "/overhead_now" if mode == "above" else "/upcoming"
+
+    def g(name, default_key):
+        return request.args.get(name, DEFAULTS[default_key])
+
+    # Base params common to both endpoints
+    params = {
+        "lat": g("lat", "lat"),
+        "lon": g("lon", "lon"),
+        "alt_m": g("alt_m", "alt_m"),
+        "min_el": g("min_el", "min_el"),
+        "limit": g("limit", "limit"),
+        "min_orbital_alt_km": g("min_orbital_alt_km", "min_orbital_alt_km"),
+        "max_orbital_alt_km": g("max_orbital_alt_km", "max_orbital_alt_km"),
+    }
+
+    # Upcoming-only knobs
+    if mode == "upcoming":
+        params.update({
+            "min_peak_el": g("min_peak_el", "min_peak_el"),
+            "window_min": g("window_min", "window_min"),
+            "step_s": g("step_s", "step_s"),
+        })
+
+    try:
+        r = requests.get(f"{API_BASE}{endpoint}", params=params, timeout=25)
+        r.raise_for_status()
+        data = r.json()
+        return jsonify(data)
+    except requests.RequestException as e:
+        return jsonify({
+            "error": f"Upstream request failed: {e}",
+            "endpoint": f"{API_BASE}{endpoint}",
+            "params": params
+        }), 502
+    except ValueError:
+        # Non-JSON response
+        return jsonify({
+            "error": "Upstream returned non-JSON",
+            "endpoint": f"{API_BASE}{endpoint}",
+            "params": params
+        }), 502
+
+# ---------------------------------------------------------------------------
+# Slew + Park proxies
+@app.post("/api/slew")
+def api_slew():
+    """
+    JSON body: { "name": "<TLE-satellite-name>" }
+    Proxies: POST {SLEW_BASE}/slew/satellite/{url-encoded name}
+    """
+    name = (request.json or {}).get("name", "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "Missing satellite name"}), 400
+
+    url = f"{SLEW_BASE}/slew/satellite/{quote(name)}"
+    try:
+        r = requests.post(url, timeout=45)
+        r.raise_for_status()
+        return jsonify({"ok": True, "mount_response": _safe_json(r)})
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": str(e), "slew_url": url}), 502
+
+@app.post("/api/park")
+def api_park():
+    """
+    Proxies: POST {SLEW_BASE}/park
+    If your park endpoint differs (e.g., /slew/park), change PARK_PATH below.
+    """
+    PARK_PATH = "/park"
+    url = f"{SLEW_BASE}{PARK_PATH}"
+    try:
+        r = requests.post(url, timeout=45)
+        r.raise_for_status()
+        return jsonify({"ok": True, "mount_response": _safe_json(r)})
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": str(e), "park_url": url}), 502
+
+def _safe_json(resp: requests.Response):
+    try:
+        return resp.json()
+    except Exception:
+        return {"status_code": resp.status_code, "text": resp.text[:2000]}
+
+# ---------------------------------------------------------------------------
+# UI (Bootstrap + high-contrast palette)
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Sat Passes — Above / Upcoming</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+
+<style>
+:root{
+  --bg: #0f1320;
+  --surface: #161b2e;
+  --border: #2c3a5e;
+  --text: #f2f4f8;
+  --text-muted: #a6b0c3;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --card-hover: #1b2240;
+  --input-bg: #0f1624;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+.card { background: var(--surface); border: 1px solid var(--border); }
+.card.clickable:hover { background: var(--card-hover); }
+.muted { color: var(--text-muted); }
+h5 { letter-spacing:.2px; font-weight:600; }
+
+.btn-outline-light { color: var(--text); border-color: var(--text); }
+.btn-outline-light:hover { background: var(--text); color: #000; }
+.btn-primary { background: var(--accent); border-color: var(--accent); }
+.btn-primary:hover { filter: brightness(1.1); }
+.text-bg-primary { background-color: var(--accent) !important; color: var(--accent-contrast) !important; }
+
+.param-row input { background: var(--input-bg); color: var(--text); border-color: var(--border); }
+.param-row input:focus { border-color: var(--accent); box-shadow: 0 0 0 .2rem rgba(37, 99, 235, .25); }
+
+.fixed-bar { position: sticky; top: 0; z-index: 1000; padding: .6rem .2rem; background: var(--bg); border-bottom:1px solid var(--border); }
+.spinner { width: 1rem; height: 1rem; border: 2px solid var(--text-muted); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; display:inline-block; margin-left:.5rem;}
+@keyframes spin { to { transform: rotate(360deg); } }
+.truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.badge-mode { font-size: .9rem; }
+
+.toast-container { position: fixed; top: 1rem; right: 1rem; z-index: 2000; }
+body, body * {
+  color: #ffffff !important;
+}
+
+</style>
+
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="container py-3">
+
+  <div class="fixed-bar d-flex align-items-center justify-content-between">
+    <div class="d-flex align-items-center gap-2">
+      <span class="badge text-bg-primary badge-mode" id="modeBadge">Mode: Above</span>
+      <button class="btn btn-sm btn-outline-light" id="refreshBtn" title="Refresh list">Refresh</button>
+      <button class="btn btn-sm btn-primary" id="parkBtn" title="Park mount">Park</button>
+      <span id="loading" class="d-none"><span class="spinner"></span></span>
+    </div>
+    <div class="muted small" id="nowLocal"></div>
+  </div>
+
+  <div class="row g-3 mt-2">
+    <div class="col-12 col-lg-4">
+      <div class="card p-3">
+        <h5 class="mb-3">Query</h5>
+
+        <div class="mb-2">
+          <div class="btn-group" role="group" aria-label="Mode">
+            <input type="radio" class="btn-check" name="mode" id="modeAbove" autocomplete="off" checked>
+            <label class="btn btn-outline-primary" for="modeAbove">Above (now)</label>
+            <input type="radio" class="btn-check" name="mode" id="modeUpcoming" autocomplete="off">
+            <label class="btn btn-outline-primary" for="modeUpcoming">Upcoming</label>
+          </div>
+        </div>
+
+        <div class="row g-2 param-row">
+          <div class="col-6">
+            <label class="form-label">Lat</label>
+            <input id="lat" class="form-control" type="number" step="0.0001" value="{{ defaults.lat }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Lon</label>
+            <input id="lon" class="form-control" type="number" step="0.0001" value="{{ defaults.lon }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Alt (m)</label>
+            <input id="alt_m" class="form-control" type="number" step="1" value="{{ defaults.alt_m }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Limit</label>
+            <input id="limit" class="form-control" type="number" step="1" value="{{ defaults.limit }}">
+          </div>
+
+          <div class="col-6">
+            <label class="form-label">Min El (°)</label>
+            <input id="min_el" class="form-control" type="number" step="1" value="{{ defaults.min_el }}">
+          </div>
+
+          <div class="col-6">
+            <label class="form-label">Min Alt (km)</label>
+            <input id="min_orbital_alt_km" class="form-control" type="number" step="1" value="{{ defaults.min_orbital_alt_km }}">
+          </div>
+          <div class="col-6">
+            <label class="form-label">Max Alt (km)</label>
+            <input id="max_orbital_alt_km" class="form-control" type="number" step="1" value="{{ defaults.max_orbital_alt_km }}">
+          </div>
+
+          <div id="upcomingOnly" class="col-12">
+            <div class="row g-2">
+              <div class="col-6">
+                <label class="form-label">Min Peak El (°)</label>
+                <input id="min_peak_el" class="form-control" type="number" step="1" value="{{ defaults.min_peak_el }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Window (min)</label>
+                <input id="window_min" class="form-control" type="number" step="1" value="{{ defaults.window_min }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label">Step (s)</label>
+                <input id="step_s" class="form-control" type="number" step="1" value="{{ defaults.step_s }}">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-3 d-grid">
+          <button id="runBtn" class="btn btn-primary">Run</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-8">
+      <div class="card p-3">
+        <div class="d-flex align-items-center justify-content-between mb-2">
+          <h5 class="m-0">Satellites</h5>
+          <div class="muted small" id="summary"></div>
+        </div>
+        <div id="results" class="vstack gap-2"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const modeAbove = document.getElementById('modeAbove');
+const modeUpcoming = document.getElementById('modeUpcoming');
+const modeBadge = document.getElementById('modeBadge');
+const upcomingOnly = document.getElementById('upcomingOnly');
+const results = document.getElementById('results');
+const summary = document.getElementById('summary');
+const loading = document.getElementById('loading');
+const nowLocal = document.getElementById('nowLocal');
+
+function updateNow(){ nowLocal.textContent = new Date().toLocaleString(); }
+setInterval(updateNow, 1000); updateNow();
+
+function currentMode(){ return modeAbove.checked ? 'above' : 'upcoming'; }
+function setModeUI(){
+  const m = currentMode();
+  modeBadge.textContent = 'Mode: ' + (m === 'above' ? 'Above' : 'Upcoming');
+  upcomingOnly.style.display = (m === 'above') ? 'none' : 'block';
+}
+modeAbove.addEventListener('change', setModeUI);
+modeUpcoming.addEventListener('change', setModeUI);
+setModeUI();
+
+function getVal(id){ return document.getElementById(id).value; }
+
+document.getElementById('runBtn').addEventListener('click', fetchPasses);
+document.getElementById('refreshBtn').addEventListener('click', fetchPasses);
+document.getElementById('parkBtn').addEventListener('click', async () => {
+  const ok = confirm('Park the mount now?');
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/park', { method: 'POST' });
+    const data = await r.json();
+    if (data.ok) toast('Park', 'Mount parking command sent.');
+    else toast('Park failed', data.error || 'Unknown error', true);
+  } catch (e) { toast('Park failed', String(e), true); }
+});
+
+// initial load
+fetchPasses();
+
+async function fetchPasses(){
+  loading.classList.remove('d-none');
+  try {
+    const params = new URLSearchParams({
+      mode: currentMode(),
+      lat: getVal('lat'),
+      lon: getVal('lon'),
+      alt_m: getVal('alt_m'),
+      limit: getVal('limit'),
+      min_el: getVal('min_el'),
+      min_orbital_alt_km: getVal('min_orbital_alt_km'),
+      max_orbital_alt_km: getVal('max_orbital_alt_km'),
+    });
+    if (currentMode() === 'upcoming') {
+      params.set('min_peak_el', getVal('min_peak_el'));
+      params.set('window_min', getVal('window_min'));
+      params.set('step_s', getVal('step_s'));
+    }
+    const r = await fetch('/api/passes?' + params.toString());
+    const data = await r.json();
+    renderResults(data);
+  } catch (e) {
+    results.innerHTML = '';
+    summary.textContent = 'Error';
+    toast('Query failed', String(e), true);
+  } finally {
+    loading.classList.add('d-none');
+  }
+}
+
+function dhms(ms){
+  if (ms == null) return '—';
+  const sign = ms < 0 ? '-' : '';
+  ms = Math.abs(ms);
+  const s = Math.floor(ms/1000);
+  const h = Math.floor(s/3600);
+  const m = Math.floor((s%3600)/60);
+  const ss = s%60;
+  const parts = [];
+  if (h) parts.push(h+'h');
+  if (m || h) parts.push(m+'m');
+  parts.push(ss+'s');
+  return sign + parts.join(' ');
+}
+
+let tickTimer = null;
+function startTicking(){
+  if (tickTimer) clearInterval(tickTimer);
+  tickTimer = setInterval(() => {
+    const now = Date.now();
+    document.querySelectorAll('[data-ts]').forEach(el => {
+      const t = Number(el.dataset.ts);
+      el.textContent = dhms(t - now);
+    });
+  }, 1000);
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function renderResults(data){
+  results.innerHTML = '';
+  if (!data || data.error){
+    summary.textContent = 'Error';
+    results.innerHTML = `<div class="text-danger small">${escapeHtml(data?.error || 'Unknown error')}</div>`;
+    return;
+  }
+
+  const count = data.count ?? (data.sats ? data.sats.length : 0) ?? 0;
+  summary.textContent = `${count} result(s) — server now: ${escapeHtml(data.now_utc || 'N/A')}`;
+
+  const isAbove = (currentMode() === 'above');
+  const sats = Array.isArray(data.sats) ? data.sats : [];
+
+  sats.forEach(s => {
+    const name = s.tle_name || s.name || 'Unknown';
+    const norad = s.norad_id ?? '—';
+
+    const riseTs = s.rise_time_utc ? Date.parse(s.rise_time_utc) : null;
+    const peakTs = s.peak_time_utc ? Date.parse(s.peak_time_utc) : null;
+
+    const azRise = (s.az_at_rise_deg != null) ? Number(s.az_at_rise_deg).toFixed(1) + '°' : '—';
+    const elPeak = (s.peak_el_deg != null) ? Number(s.peak_el_deg).toFixed(1) + '°' : '—';
+
+    const card = document.createElement('div');
+    card.className = 'card p-3';
+
+    const timerRise = (!isAbove && riseTs) ? `<div class="col-6 col-md-3">
+        <div class="muted small">Until Rise</div>
+        <div data-ts="${riseTs}" data-role="countdown">…</div>
+      </div>` : '';
+
+    const timerPeak = peakTs ? `<div class="col-6 col-md-3">
+        <div class="muted small">Until Peak</div>
+        <div data-ts="${peakTs}" data-role="countdown">…</div>
+      </div>` : '';
+
+    card.innerHTML = `
+      <div class="d-flex justify-content-between align-items-center">
+        <div class="truncate">
+          <strong>${escapeHtml(name)}</strong>
+          <span class="muted ms-2">NORAD ${escapeHtml(norad)}</span>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-light" data-action="slew">Slew…</button>
+        </div>
+      </div>
+      <div class="mt-2 row g-2">
+        ${timerRise}
+        ${timerPeak}
+        <div class="col-6 col-md-3">
+          <div class="muted small">Rise Az</div>
+          <div>${azRise}</div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="muted small">Peak El</div>
+          <div>${elPeak}</div>
+        </div>
+      </div>
+    `;
+
+    card.querySelector('[data-action="slew"]').addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const ok = confirm(`Slew to "${name}"?`);
+      if (!ok) return;
+      try{
+        const r = await fetch('/api/slew', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        const out = await r.json();
+        if (out.ok) toast('Slew', `Command sent for "${name}".`);
+        else toast('Slew failed', out.error || 'Unknown error', true);
+      } catch(e){ toast('Slew failed', String(e), true); }
+    });
+
+    results.appendChild(card);
+  });
+
+  // seed countdown values and start ticking
+  document.querySelectorAll('[data-role="countdown"]').forEach(el => {
+    const ts = Number(el.dataset.ts);
+    el.textContent = dhms(ts - Date.now());
+  });
+  startTicking();
+}
+
+function toast(title, body, isError=false){
+  const el = document.createElement('div');
+  el.className = 'toast align-items-center text-bg-' + (isError ? 'danger' : 'dark');
+  el.setAttribute('role', 'alert');
+  el.innerHTML = `
+    <div class="d-flex">
+      <div class="toast-body">
+        <strong>${escapeHtml(title)}:</strong> ${escapeHtml(body)}
+      </div>
+      <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+    </div>`;
+  document.getElementById('toasts').appendChild(el);
+  const t = new bootstrap.Toast(el, { delay: 3000 });
+  t.show();
+}
+</script>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",debug=True, port=5000)

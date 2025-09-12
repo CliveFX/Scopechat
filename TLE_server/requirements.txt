@@ -1,0 +1,6 @@
+fastapi==0.110.2
+pydantic==2.5.3
+requests==2.31.0
+numpy==1.26.2
+sgp4==2.22
+uvicorn[standard]
