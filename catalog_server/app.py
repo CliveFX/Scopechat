@@ -8,7 +8,7 @@ from typing import Optional
 
 # Astropy for coordinate handling and transformations
 # get_body requires the 'jplephem' package to be installed for ephemeris data
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_body
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz, get_body, GCRS
 from astropy.time import Time
 import astropy.units as u
 
@@ -69,11 +69,44 @@ class HealthStatus(BaseModel):
 class SlewResponse(BaseModel):
     message: str
     object_name: str
-    resolved_ra: str
-    resolved_dec: str
+    j2000_ra: Optional[str] = None
+    j2000_dec: Optional[str] = None
+    jnow_ra: str
+    jnow_dec: str
     current_altitude: float
     current_azimuth: float
     slew_command_sent: bool
+
+# ---- Helper functions ---- 
+def get_jnow_coords(target_coords_j2000: SkyCoord, current_time: Time) -> SkyCoord:
+    """
+    Transforms celestial coordinates from J2000.0 to the current epoch (JNOW).
+
+    This is crucial for accurate telescope pointing. It accounts for:
+    - Precession: The slow wobble of Earth's axis.
+    - Nutation: Short-term variations on top of precession.
+    - Proper Motion: The actual movement of the star across the sky, if this
+      information is available in the catalog data fetched by SkyCoord.
+
+    Args:
+        target_coords_j2000: A SkyCoord object in the ICRS/J2000 frame.
+        current_time: The current astropy Time object.
+
+    Returns:
+        A new SkyCoord object representing the object's position in the
+        current epoch (GCRS frame, which is effectively JNOW).
+    """
+    print(f"Original J2000 RA/Dec: {target_coords_j2000.to_string('hmsdms')}")
+
+    # Transform from ICRS (J2000) to GCRS (Geocentric Celestial Reference System)
+    # at the current time. This gives us the "of-date" or JNOW coordinates.
+    # This transformation automatically applies proper motion if it's part of the
+    # SkyCoord object.
+    jnow_frame = GCRS(obstime=current_time)
+    target_coords_jnow = target_coords_j2000.transform_to(jnow_frame)
+
+    print(f"Corrected JNOW RA/Dec:  {target_coords_jnow.to_string('hmsdms')}")
+    return target_coords_jnow
 
 # --- API Endpoint ---
 @app.get("/healthz", response_model=HealthStatus, summary="Check service health")
@@ -128,13 +161,24 @@ def slew_by_name(slew_request: SlewRequest):
     current_time = Time.now()
 
     # 2. Resolve the object name to celestial coordinates
+    j2000_ra_str = None
+    j2000_dec_str = None
     try:
         if object_name.lower() in SOLAR_SYSTEM_BODIES:
             print(f"'{object_name}' is a solar system body. Calculating its current position...")
+            # get_body already returns coordinates for the current time, no conversion needed
             target_coords = get_body(object_name, current_time, observer_location)
         else:
-            print(f"'{object_name}' is a deep-sky object. Querying database...")
-            target_coords = SkyCoord.from_name(object_name)
+            print(f"'{object_name}' is a deep-sky object. Querying database for J2000 coordinates...")
+            target_coords_j2000 = SkyCoord.from_name(object_name)
+
+            # Store J2000 coords for response payload
+            j2000_ra_str = target_coords_j2000.ra.to_string(unit=u.hourangle, sep=':', precision=2, pad=True)
+            j2000_dec_str = target_coords_j2000.dec.to_string(unit=u.degree, sep=':', precision=1, alwayssign=True)
+
+            # --- NEW: Convert to JNOW coordinates for the telescope ---
+            target_coords = get_jnow_coords(target_coords_j2000, current_time)
+
     except Exception as e:
         print(f"Error resolving name '{object_name}': {e}")
         raise HTTPException(
@@ -158,14 +202,13 @@ def slew_by_name(slew_request: SlewRequest):
         )
     visibility_time = time.monotonic()
 
-    # Format RA/Dec strings to ultra precision for the telescope mount.
+    # 4. Format JNOW RA/Dec strings for the telescope mount.
     ra_precision = 2  # HH:MM:SS.SS
-    dec_precision = 1  # sDD:MM:SS.S
+    dec_precision = 1 # sDD:MM:SS.S
     ra_str = target_coords.ra.to_string(unit=u.hourangle, sep=':', precision=ra_precision, pad=True)
     dec_str = target_coords.dec.to_string(unit=u.degree, sep=':', precision=dec_precision, alwayssign=True)
-    print("Using ULTRA precision for coordinates.")
 
-    print(f"Formatted coordinates for telescope API -> RA: {ra_str}, Dec: {dec_str}")
+    print(f"Formatted JNOW coordinates for telescope API -> RA: {ra_str}, Dec: {dec_str}")
 
     # 5. Send the command to the telescope control API
     try:
@@ -179,18 +222,23 @@ def slew_by_name(slew_request: SlewRequest):
             detail=f"Could not send slew command. Ensure the telescope API is running at {TELESCOPE_API_URL}."
         )
     slew_api_time = time.monotonic()
+
+    # --- Timing and Response ---
     timing_data = {
         "resolve_object_name": round((resolve_time - start_time) * 1000, 2),
         "check_visibility": round((visibility_time - resolve_time) * 1000, 2),
         "call_slew_api": round((slew_api_time - visibility_time) * 1000, 2),
         "total_duration": round((slew_api_time - start_time) * 1000, 2)
     }
-    print(timing_data)
+    print("Request timing (ms):", timing_data)
+
     return {
-        "message": f"Object '{object_name}' is visible. Slew command sent successfully.",
+        "message": f"Object '{object_name}' is visible. Slew command sent with JNOW coordinates.",
         "object_name": object_name,
-        "resolved_ra": ra_str,
-        "resolved_dec": dec_str,
+        "j2000_ra": j2000_ra_str,
+        "j2000_dec": j2000_dec_str,
+        "jnow_ra": ra_str,
+        "jnow_dec": dec_str,
         "current_altitude": round(current_altitude, 2),
         "current_azimuth": round(current_azimuth, 2),
         "slew_command_sent": True

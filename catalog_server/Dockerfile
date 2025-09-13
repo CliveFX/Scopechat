@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # app
 COPY . .
+# pre-cache
+RUN python precache_astropy_data.py
 
 # run
 EXPOSE 8002
